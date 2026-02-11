@@ -60,7 +60,7 @@ var rootCmd = &cobra.Command{
 		if err != nil {
 			settings = config.DefaultSettings()
 		}
-		GlobalPool = download.NewWorkerPool(GlobalProgressCh, settings.Connections.MaxConcurrentDownloads)
+		GlobalPool = download.NewWorkerPool(GlobalProgressCh, settings.Network.MaxConcurrentDownloads)
 	},
 	Run: func(cmd *cobra.Command, args []string) {
 		initializeGlobalState()
