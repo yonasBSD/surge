@@ -37,6 +37,8 @@ class AnalyzerConfig:
     generate_graphs: bool = True
     summary_only: bool = False
     quiet: bool = False
+    bucket_seconds: int = 5
+    health_window_seconds: int = 30
 
 
 @dataclass
@@ -749,9 +751,132 @@ def percentile(values: list[float], pct: float) -> float:
     return sorted_vals[f] + (k - f) * (sorted_vals[c] - sorted_vals[f])
 
 
+def calc_speed_fairness(speed_by_worker: dict[int, float]) -> dict[str, float]:
+    active = [s for s in speed_by_worker.values() if s > 0]
+    if not active:
+        return {"min_speed": 0.0, "max_speed": 0.0, "ratio": 0.0, "cv": 0.0}
+
+    mean = sum(active) / len(active)
+    variance = sum((s - mean) ** 2 for s in active) / len(active)
+    stddev = variance**0.5
+    min_speed = min(active)
+    max_speed = max(active)
+    ratio = (max_speed / min_speed) if min_speed > 0 else 0.0
+    cv = (stddev / mean) if mean > 0 else 0.0
+    return {
+        "min_speed": min_speed,
+        "max_speed": max_speed,
+        "ratio": ratio,
+        "cv": cv,
+    }
+
+
+def build_throughput_buckets(ctx: ReportContext, bucket_seconds: int) -> list[dict[str, Any]]:
+    if bucket_seconds <= 0:
+        bucket_seconds = 1
+    if not ctx.all_tasks:
+        return []
+
+    sorted_tasks = sorted(ctx.all_tasks, key=lambda t: t.timestamp)
+    base_ts = sorted_tasks[0].timestamp
+    buckets: dict[int, int] = {}
+    for task in sorted_tasks:
+        delta = int((task.timestamp - base_ts).total_seconds())
+        bucket_id = delta // bucket_seconds
+        buckets[bucket_id] = buckets.get(bucket_id, 0) + task.length
+
+    output = []
+    for bucket_id in sorted(buckets.keys()):
+        bytes_in_bucket = buckets[bucket_id]
+        ts = base_ts + timedelta(seconds=bucket_id * bucket_seconds)
+        mbps = (bytes_in_bucket / MB) / bucket_seconds
+        output.append(
+            {
+                "bucket_start": ts.strftime("%Y-%m-%dT%H:%M:%S"),
+                "bucket_seconds": bucket_seconds,
+                "bytes": bytes_in_bucket,
+                "throughput_mbps": mbps,
+            }
+        )
+    return output
+
+
+def compute_health_event_impact(ctx: ReportContext, window_seconds: int) -> list[dict[str, Any]]:
+    impacts = []
+    if window_seconds <= 0:
+        window_seconds = 30
+
+    health_events = ctx.data.get("health_kills", [])
+    workers_by_id = {w.worker_id: w for w in ctx.workers}
+    for event_time, worker_id, reason in health_events:
+        worker = workers_by_id.get(worker_id)
+        if not worker:
+            continue
+
+        before_start = event_time - timedelta(seconds=window_seconds)
+        after_end = event_time + timedelta(seconds=window_seconds)
+
+        before = [
+            t.speed_mbps
+            for t in worker.tasks
+            if before_start <= t.timestamp < event_time
+        ]
+        after = [
+            t.speed_mbps
+            for t in worker.tasks
+            if event_time <= t.timestamp <= after_end
+        ]
+
+        before_avg = sum(before) / len(before) if before else 0.0
+        after_avg = sum(after) / len(after) if after else 0.0
+        delta_pct = ((after_avg - before_avg) / before_avg * 100.0) if before_avg > 0 else 0.0
+
+        impacts.append(
+            {
+                "time": event_time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "worker_id": worker_id,
+                "reason": reason,
+                "window_seconds": window_seconds,
+                "before_avg_speed_mbps": before_avg,
+                "after_avg_speed_mbps": after_avg,
+                "delta_pct": delta_pct,
+            }
+        )
+    return impacts
+
+
+def print_advanced_metrics(ctx: ReportContext, cfg: AnalyzerConfig):
+    print_header("📈 ADVANCED METRICS")
+
+    task_speeds = [t.speed_mbps for t in ctx.all_tasks]
+    task_durations = [t.duration_seconds for t in ctx.all_tasks]
+    fairness = calc_speed_fairness(ctx.speed_by_worker)
+    throughput = build_throughput_buckets(ctx, cfg.bucket_seconds)
+    impacts = compute_health_event_impact(ctx, cfg.health_window_seconds)
+
+    print(f"\n  Task Duration p50/p95/p99: {percentile(task_durations, 0.5):.2f}s / {percentile(task_durations, 0.95):.2f}s / {percentile(task_durations, 0.99):.2f}s")
+    print(f"  Task Speed p50/p95/p99:    {percentile(task_speeds, 0.5):.2f} / {percentile(task_speeds, 0.95):.2f} / {percentile(task_speeds, 0.99):.2f} MB/s")
+    print(f"  Worker Speed Ratio:        {fairness['ratio']:.2f}x")
+    print(f"  Worker Speed CV:           {fairness['cv']:.2f}")
+
+    if throughput:
+        peak = max(throughput, key=lambda x: x["throughput_mbps"])
+        print(f"  Peak Throughput:           {peak['throughput_mbps']:.2f} MB/s @ {peak['bucket_start']}")
+
+    if impacts:
+        print("\n  Health Event Impacts:")
+        for item in impacts:
+            print(
+                f"  - Worker {item['worker_id']} ({item['reason']}) {item['before_avg_speed_mbps']:.2f} -> {item['after_avg_speed_mbps']:.2f} MB/s ({item['delta_pct']:.1f}%)"
+            )
+
+
 def build_json_report(ctx: ReportContext, cfg: AnalyzerConfig) -> dict[str, Any]:
     task_speeds = [t.speed_mbps for t in ctx.all_tasks]
     task_durations = [t.duration_seconds for t in ctx.all_tasks]
+    fairness = calc_speed_fairness(ctx.speed_by_worker)
+    throughput = build_throughput_buckets(ctx, cfg.bucket_seconds)
+    health_impacts = compute_health_event_impact(ctx, cfg.health_window_seconds)
 
     workers = []
     for w in ctx.workers:
@@ -772,13 +897,15 @@ def build_json_report(ctx: ReportContext, cfg: AnalyzerConfig) -> dict[str, Any]
         )
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
         "config": {
             "slow_task_multiplier": cfg.slow_task_multiplier,
             "gap_warning_ms": cfg.gap_warning_ms,
             "speed_variance_warn_ratio": cfg.speed_variance_warn_ratio,
             "top_n_slow_tasks": cfg.top_n_slow_tasks,
+            "bucket_seconds": cfg.bucket_seconds,
+            "health_window_seconds": cfg.health_window_seconds,
         },
         "download_info": {
             **ctx.data["download_info"],
@@ -795,7 +922,10 @@ def build_json_report(ctx: ReportContext, cfg: AnalyzerConfig) -> dict[str, Any]
             "task_duration_p95_s": round(percentile(task_durations, 0.95), 6),
             "task_speed_p50_mbps": round(percentile(task_speeds, 0.5), 6),
             "task_speed_p95_mbps": round(percentile(task_speeds, 0.95), 6),
+            "task_speed_p99_mbps": round(percentile(task_speeds, 0.99), 6),
             "slow_task_count": len(ctx.slow_tasks),
+            "worker_speed_ratio": round(fairness["ratio"], 6),
+            "worker_speed_cv": round(fairness["cv"], 6),
         },
         "workers": workers,
         "events": {
@@ -808,6 +938,8 @@ def build_json_report(ctx: ReportContext, cfg: AnalyzerConfig) -> dict[str, Any]
                 for ts, wid, reason in ctx.data["health_kills"]
             ],
         },
+        "throughput_buckets": throughput,
+        "health_event_impacts": health_impacts,
     }
 
 
@@ -818,7 +950,65 @@ def write_json_report(report: dict[str, Any], output_dir: str):
     print(f"📄 JSON report saved to: {path}")
 
 
-def write_csv_reports(ctx: ReportContext, output_dir: str):
+def write_html_report(report: dict[str, Any], output_dir: str):
+    path = Path(output_dir) / "analysis_report.html"
+    summary = report.get("summary", {})
+    workers = report.get("workers", [])
+    throughput = report.get("throughput_buckets", [])
+
+    worker_rows = "\n".join(
+        f"<tr><td>{w['worker_id']}</td><td>{w['task_count']}</td><td>{w['avg_speed_mbps']:.2f}</td><td>{w['utilization']:.2f}</td><td>{w['idle_time']:.2f}</td></tr>"
+        for w in workers
+    )
+    throughput_rows = "\n".join(
+        f"<tr><td>{b['bucket_start']}</td><td>{b['throughput_mbps']:.2f}</td><td>{b['bytes']}</td></tr>"
+        for b in throughput
+    )
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Surge Analysis Report</title>
+<style>
+body {{ font-family: Helvetica, Arial, sans-serif; margin: 24px; color: #222; }}
+h1, h2 {{ margin-bottom: 8px; }}
+table {{ border-collapse: collapse; width: 100%; margin: 12px 0 24px; }}
+th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
+th {{ background: #f5f7fb; }}
+.cards {{ display: grid; grid-template-columns: repeat(4, minmax(120px, 1fr)); gap: 12px; }}
+.card {{ background: #f5f7fb; border: 1px solid #dbe1ee; border-radius: 6px; padding: 10px; }}
+.label {{ color: #5b6470; font-size: 12px; }}
+.value {{ font-size: 22px; font-weight: 700; }}
+</style>
+</head>
+<body>
+  <h1>Surge Download Analysis</h1>
+  <div class="cards">
+    <div class="card"><div class="label">Workers</div><div class="value">{summary.get('worker_count', 0)}</div></div>
+    <div class="card"><div class="label">Tasks</div><div class="value">{summary.get('task_count', 0)}</div></div>
+    <div class="card"><div class="label">Avg Speed (MB/s)</div><div class="value">{summary.get('global_avg_speed_mbps', 0):.2f}</div></div>
+    <div class="card"><div class="label">Slow Tasks</div><div class="value">{summary.get('slow_task_count', 0)}</div></div>
+  </div>
+  <h2>Worker Stats</h2>
+  <table>
+    <thead><tr><th>Worker</th><th>Tasks</th><th>Avg Speed (MB/s)</th><th>Utilization %</th><th>Idle (s)</th></tr></thead>
+    <tbody>{worker_rows}</tbody>
+  </table>
+  <h2>Throughput Buckets</h2>
+  <table>
+    <thead><tr><th>Bucket Start</th><th>Throughput (MB/s)</th><th>Bytes</th></tr></thead>
+    <tbody>{throughput_rows}</tbody>
+  </table>
+</body>
+</html>
+"""
+    with path.open("w", encoding="utf-8") as f:
+        f.write(html)
+    print(f"📄 HTML report saved to: {path}")
+
+
+def write_csv_reports(ctx: ReportContext, output_dir: str, bucket_seconds: int, health_window_seconds: int):
     per_worker_path = Path(output_dir) / "workers.csv"
     with per_worker_path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
@@ -874,7 +1064,50 @@ def write_csv_reports(ctx: ReportContext, output_dir: str):
                     ]
                 )
 
-    print(f"📄 CSV reports saved to: {per_worker_path}, {tasks_path}")
+    throughput = build_throughput_buckets(ctx, bucket_seconds)
+    throughput_path = Path(output_dir) / "throughput.csv"
+    with throughput_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["bucket_start", "bucket_seconds", "bytes", "throughput_mbps"])
+        for bucket in throughput:
+            writer.writerow(
+                [
+                    bucket["bucket_start"],
+                    bucket["bucket_seconds"],
+                    bucket["bytes"],
+                    f"{bucket['throughput_mbps']:.6f}",
+                ]
+            )
+
+    impacts = compute_health_event_impact(ctx, health_window_seconds)
+    impacts_path = Path(output_dir) / "health_impacts.csv"
+    with impacts_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            [
+                "time",
+                "worker_id",
+                "reason",
+                "window_seconds",
+                "before_avg_speed_mbps",
+                "after_avg_speed_mbps",
+                "delta_pct",
+            ]
+        )
+        for impact in impacts:
+            writer.writerow(
+                [
+                    impact["time"],
+                    impact["worker_id"],
+                    impact["reason"],
+                    impact["window_seconds"],
+                    f"{impact['before_avg_speed_mbps']:.6f}",
+                    f"{impact['after_avg_speed_mbps']:.6f}",
+                    f"{impact['delta_pct']:.6f}",
+                ]
+            )
+
+    print(f"📄 CSV reports saved to: {per_worker_path}, {tasks_path}, {throughput_path}, {impacts_path}")
 
 
 def analyze_and_report(data: dict[str, Any], cfg: AnalyzerConfig, output_format: str = "text") -> int:
@@ -888,6 +1121,7 @@ def analyze_and_report(data: dict[str, Any], cfg: AnalyzerConfig, output_format:
         print_worker_table(ctx, cfg)
         print_speed_variance(ctx, cfg)
         print_slow_tasks(ctx, cfg)
+        print_advanced_metrics(ctx, cfg)
         if not cfg.summary_only:
             print_worker_details(ctx, cfg)
             print_balancer_activity(ctx)
@@ -895,11 +1129,18 @@ def analyze_and_report(data: dict[str, Any], cfg: AnalyzerConfig, output_format:
 
     ensure_output_dir(cfg.output_dir)
 
+    report: Optional[dict[str, Any]] = None
     if output_format in ("json", "all"):
-        write_json_report(build_json_report(ctx, cfg), cfg.output_dir)
+        report = build_json_report(ctx, cfg)
+        write_json_report(report, cfg.output_dir)
 
     if output_format in ("csv", "all"):
-        write_csv_reports(ctx, cfg.output_dir)
+        write_csv_reports(ctx, cfg.output_dir, cfg.bucket_seconds, cfg.health_window_seconds)
+
+    if output_format in ("html", "all"):
+        if report is None:
+            report = build_json_report(ctx, cfg)
+        write_html_report(report, cfg.output_dir)
 
     if cfg.generate_graphs and output_format in ("text", "all"):
         if not cfg.quiet:
@@ -923,7 +1164,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", default=".", help="Directory for generated reports/graphs")
     parser.add_argument(
         "--format",
-        choices=["text", "json", "csv", "all"],
+        choices=["text", "json", "csv", "html", "all"],
         default="text",
         help="Output format",
     )
@@ -942,6 +1183,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Warn if fastest worker exceeds slowest by this ratio",
     )
     parser.add_argument("--top-n-slow-tasks", type=int, default=3, help="Show top N slow tasks per worker")
+    parser.add_argument("--bucket-seconds", type=int, default=5, help="Throughput bucket size in seconds")
+    parser.add_argument(
+        "--health-window-seconds",
+        type=int,
+        default=30,
+        help="Window size for before/after health-event speed impact",
+    )
     return parser
 
 
@@ -959,6 +1207,12 @@ def main() -> int:
     if since and until and since > until:
         print("❌ --since must be earlier than or equal to --until")
         return 2
+    if args.bucket_seconds <= 0:
+        print("❌ --bucket-seconds must be > 0")
+        return 2
+    if args.health_window_seconds <= 0:
+        print("❌ --health-window-seconds must be > 0")
+        return 2
 
     cfg = AnalyzerConfig(
         slow_task_multiplier=args.slow_task_multiplier,
@@ -969,6 +1223,8 @@ def main() -> int:
         generate_graphs=not args.no_graphs,
         summary_only=args.summary_only,
         quiet=args.quiet,
+        bucket_seconds=args.bucket_seconds,
+        health_window_seconds=args.health_window_seconds,
     )
 
     if not cfg.quiet:
